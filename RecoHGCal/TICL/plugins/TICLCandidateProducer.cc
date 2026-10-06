@@ -7,6 +7,7 @@
 #include "FWCore/ParameterSet/interface/PluginDescription.h"
 #include "FWCore/MessageLogger/interface/MessageLogger.h"
 #include "FWCore/Utilities/interface/ESGetToken.h"
+#include "FWCore/Utilities/interface/Exception.h"
 #include "FWCore/Framework/interface/ESHandle.h"
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/Framework/interface/MakerMacros.h"
@@ -132,7 +133,7 @@ TICLCandidateProducer::TICLCandidateProducer(const edm::ParameterSet &ps, const 
       muons_token_(consumes<std::vector<reco::Muon>>(ps.getParameter<edm::InputTag>("muons"))),
       useMTDTiming_(ps.getParameter<bool>("useMTDTiming")),
       useTimingAverage_(ps.getParameter<bool>("useTimingAverage")),
-      timingQualityThreshold_(ps.getParameter<double>("timingQualityThreshold")),
+      timingQualityThreshold_(ps.getParameter<float>("timingQualityThreshold")),
       ticlGeomToken_(esConsumes<TICLGeomHost, CaloGeometryRecord, edm::Transition::BeginRun>(edm::ESInputTag("", ""))),
       ticlGeomLookupToken_(
           esConsumes<TICLGeomLookupHost, CaloGeometryRecord, edm::Transition::BeginRun>(edm::ESInputTag("", ""))),
@@ -209,6 +210,7 @@ TICLCandidateProducer::TICLCandidateProducer(const edm::ParameterSet &ps, const 
   }
 
   produces<std::vector<TICLCandidate>>();
+  produces<std::vector<std::vector<unsigned int>>>("linkedTracksters");
 
   // New trackster collection after linking
   produces<std::vector<Trackster>>();
@@ -318,21 +320,6 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
     //Fill MultiSpan
     generalTrackstersSpan.add(*general_tracksters_h[i]);
   }
-  //now get the general_tracksterlinks_tokens_
-  std::vector<edm::Handle<std::vector<std::vector<unsigned>>>> general_tracksterlinks_h(
-      general_tracksterlinks_tokens_.size());
-  std::vector<std::vector<unsigned>> generalTracksterLinksGlobalId;
-  for (unsigned int i = 0; i < general_tracksterlinks_tokens_.size(); ++i) {
-    evt.getByToken(general_tracksterlinks_tokens_[i], general_tracksterlinks_h[i]);
-    for (unsigned int j = 0; j < general_tracksterlinks_h[i]->size(); ++j) {
-      generalTracksterLinksGlobalId.emplace_back();
-      auto &links_vector = generalTracksterLinksGlobalId.back();
-      links_vector.resize((*general_tracksterlinks_h[i])[j].size());
-      for (unsigned int k = 0; k < links_vector.size(); ++k) {
-        links_vector[k] = generalTrackstersSpan.globalIndex(i, (*general_tracksterlinks_h[i])[j][k]);
-      }
-    }
-  }
 
   std::vector<bool> maskTracks;
   maskTracks.resize(tracks.size());
@@ -354,14 +341,8 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
     }
   }
 
-  const typename TICLInterpretationAlgoBase<reco::Track>::Inputs muonInput(evt,
-                                                                           es,
-                                                                           layerClusters,
-                                                                           layerClustersTimes,
-                                                                           generalTrackstersSpan,
-                                                                           generalTracksterLinksGlobalId,
-                                                                           tracks_h,
-                                                                           muonTrackMask);
+  const typename TICLInterpretationAlgoBase<reco::Track>::Inputs muonInput(
+      evt, es, layerClusters, layerClustersTimes, generalTrackstersSpan, tracks_h, muonTrackMask);
   auto resultCandidates = std::make_unique<std::vector<TICLCandidate>>();
   std::vector<int> muonInTrackIndices(tracks.size(), -1);
   std::vector<int> trackstersInTrackIndices(tracks.size(), -1);
@@ -375,8 +356,18 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
   // muon-candidate track, the consumed trackster (>=0), no trackster (-1, a track-only
   // muon), or a rejection (kMuonRejected: the trajectory points to a shower).
   std::vector<bool> maskedInputTracksters(generalTrackstersSpan.size(), false);
+  // Every interpretation pass records, for each trackster it emits, the input tracksters
+  // it was built from. The two collections are indexed in parallel.
+  auto checkLinks = [](const char *pass, size_t tracksters, size_t links) {
+    if (links != tracksters)
+      throw cms::Exception("LogicError") << "TICLCandidateProducer: the " << pass << " pass emitted " << tracksters
+                                         << " tracksters and " << links << " linked-trackster entries";
+  };
+
   muonInterpretationAlgo_->makeCandidates(
-      muonInput, inputTiming_h, *resultTracksters, muonInTrackIndices, maskedInputTracksters);
+      muonInput, inputTiming_h, *resultTracksters, muonInTrackIndices, maskedInputTracksters, *linkedResultTracksters);
+  checkLinks("muon", resultTracksters->size(), linkedResultTracksters->size());
+  const size_t nTrackstersFromMuons = resultTracksters->size();
 
   // A track the muon pass rejected is not a muon: route it back to the general pass so
   // it is reconstructed there (and no muon candidate is built for it below).
@@ -387,16 +378,13 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
     }
   }
 
-  const typename TICLInterpretationAlgoBase<reco::Track>::Inputs input(evt,
-                                                                       es,
-                                                                       layerClusters,
-                                                                       layerClustersTimes,
-                                                                       generalTrackstersSpan,
-                                                                       generalTracksterLinksGlobalId,
-                                                                       tracks_h,
-                                                                       generalTrackMask);
+  const typename TICLInterpretationAlgoBase<reco::Track>::Inputs input(
+      evt, es, layerClusters, layerClustersTimes, generalTrackstersSpan, tracks_h, generalTrackMask);
   generalInterpretationAlgo_->makeCandidates(
-      input, inputTiming_h, *resultTracksters, trackstersInTrackIndices, maskedInputTracksters);
+      input, inputTiming_h, *resultTracksters, trackstersInTrackIndices, maskedInputTracksters, *linkedResultTracksters);
+  checkLinks("general",
+             resultTracksters->size() - nTrackstersFromMuons,
+             linkedResultTracksters->size() - nTrackstersFromMuons);
 
   assignPCAtoTracksters(*resultTracksters,
                         layerClusters,
@@ -411,6 +399,12 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
 
   std::vector<bool> maskTracksters(resultTracksters->size(), true);
   edm::OrphanHandle<std::vector<Trackster>> resultTracksters_h = evt.put(std::move(resultTracksters));
+  auto linkedTracksters = std::make_unique<std::vector<std::vector<unsigned int>>>();
+  // One linked-tracksters entry per candidate: at most one candidate per track, plus at
+  // most one neutral candidate per result trackster.
+  const size_t maxCandidates = resultTracksters_h->size() + tracks.size();
+  resultCandidates->reserve(maxCandidates);
+  linkedTracksters->reserve(maxCandidates);
 
   // Muon candidates: energy from the track momentum (pdgId 13), attaching the MIP
   // trackster the muon pass associated (if any) and masking it so it is not re-emitted.
@@ -424,9 +418,12 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
     if (tracksterId >= 0) {
       tracksterPtr = edm::Ptr<Trackster>(resultTracksters_h, tracksterId);
       maskTracksters[tracksterId] = false;
+      linkedTracksters->push_back((*linkedResultTracksters)[tracksterId]);
+    } else {
+      linkedTracksters->emplace_back();
     }
     TICLCandidate muonCandidate(trackPtr, tracksterPtr);
-    muonCandidate.setPdgId(13 * tk.charge());
+    muonCandidate.setPdgId(-13 * tk.charge());
     math::PtEtaPhiMLorentzVector p4Polar(tk.pt(), tk.eta(), tk.phi(), ticl::mmuon);
     muonCandidate.setP4(p4Polar);
     resultCandidates->push_back(muonCandidate);
@@ -437,9 +434,10 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
     if (generalTrackMask[iTrack]) {
       auto const tracksterId = trackstersInTrackIndices[iTrack];
       auto trackPtr = edm::Ptr<reco::Track>(tracks_h, iTrack);
-      if (tracksterId != -1 and !maskTracksters.empty()) {
+      if (tracksterId >= 0) {
         auto tracksterPtr = edm::Ptr<Trackster>(resultTracksters_h, tracksterId);
         TICLCandidate chargedCandidate(trackPtr, tracksterPtr);
+        linkedTracksters->push_back((*linkedResultTracksters)[tracksterId]);
         resultCandidates->push_back(chargedCandidate);
         maskTracksters[tracksterId] = false;
       }
@@ -452,6 +450,7 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
       edm::Ptr<Trackster> tracksterPtr(resultTracksters_h, iTrackster);
       edm::Ptr<reco::Track> trackPtr;
       TICLCandidate neutralCandidate(trackPtr, tracksterPtr);
+      linkedTracksters->push_back((*linkedResultTracksters)[iTrackster]);
       resultCandidates->push_back(neutralCandidate);
     }
   }
@@ -511,6 +510,7 @@ void TICLCandidateProducer::produce(edm::Event &evt, const edm::EventSetup &es) 
   assignTimeToCandidates(*resultCandidates, tracks_h, inputTimingView, getPathLength);
 
   evt.put(std::move(resultCandidates));
+  evt.put(std::move(linkedTracksters), "linkedTracksters");
 }
 
 template <typename F>
@@ -615,7 +615,7 @@ void TICLCandidateProducer::fillDescriptions(edm::ConfigurationDescriptions &des
   desc.add<std::string>("propagator", "PropagatorWithMaterial");
   desc.add<bool>("useMTDTiming", true);
   desc.add<bool>("useTimingAverage", true);
-  desc.add<double>("timingQualityThreshold", 0.5);
+  desc.add<float>("timingQualityThreshold", 0.5);
   desc.add<std::string>("cutTk",
                         "1.48 < abs(eta) < 3.0 && pt > 1. && quality(\"highPurity\") && "
                         "hitPattern().numberOfLostHits(\"MISSING_OUTER_HITS\") < 5");
